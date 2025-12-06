@@ -24,7 +24,11 @@ namespace CorePatcher.Configs
         [DefaultValue(true)]
         [ReloadRequired]
         public bool ReloadUponPatching;
-
+        
+        [Header("Multiplayer")]
+        [DefaultValue(true)]
+        [ReloadRequired]
+        public bool GenerateServerScripts;
         /// <summary>
         /// Mainly for developper, will prompt a message on start up
         /// </summary>

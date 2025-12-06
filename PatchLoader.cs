@@ -122,6 +122,12 @@ namespace CorePatcher
 
             CopyRuntimeConfig();
 
+            // Generate scripts for easier Dedicated Server hosting
+            if (ModContent.GetInstance<CorePatcherConfig>().GenerateServerScripts)
+            {
+                CreateServerScripts();
+            }
+
             Restart();
         }
 
@@ -132,11 +138,6 @@ namespace CorePatcher
             return CorePatchedFieldInfo != null;
         }
 
-        /// <summary>
-        /// TODO: Find a way to execute this after the game has exited, maybe a batch script? 
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
         private static void DeleteOnceDone(object sender, EventArgs e)
         {
             if (DetectPatchedAssembly())
@@ -165,26 +166,76 @@ namespace CorePatcher
             }
         }
 
+        private static void CreateServerScripts()
+        {
+            try
+            {
+                string patchedDll = "tModLoader.patched.dll";
+
+                // Windows Batch Script
+                string batPath = Path.Combine(Environment.CurrentDirectory, "start-patched-server.bat");
+                string batContent = $"@echo off\r\n" +
+                                    $"echo Launching CorePatcher Server...\r\n" +
+                                    $"dotnet \"{patchedDll}\" -server %*\r\n" +
+                                    $"pause";
+                File.WriteAllText(batPath, batContent);
+
+                // Linux/Mac Shell Script
+                string shPath = Path.Combine(Environment.CurrentDirectory, "start-patched-server.sh");
+                string shContent = $"#!/bin/sh\n" +
+                                   $"echo \"Launching CorePatcher Server...\"\n" +
+                                   $"dotnet \"{patchedDll}\" -server \"$@\"";
+                File.WriteAllText(shPath, shContent);
+
+                // Attempt chmod +x for Mac/Linux
+                if (Environment.OSVersion.Platform == PlatformID.Unix || Environment.OSVersion.Platform == PlatformID.MacOSX)
+                {
+                    try { Process.Start("chmod", $"+x \"{shPath}\""); } catch { }
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"[CorePatcher] Failed to create server scripts: {e.Message}");
+            }
+        }
+
         private static void Restart()
         {
             if (!ModContent.GetInstance<CorePatcherConfig>().ReloadUponPatching)
             {
                 return;
             }
-            Process process = new Process();
-            process.StartInfo = new ProcessStartInfo("dotnet", "\"tModLoader.patched.dll\"")
+
+            // FIX FOR HOST & PLAY / STEAM INTEGRATION
+
+            // 1. Force Steam App ID (1281930 for tModLoader)
+            // This ensures Steamworks initializes even if launched via dotnet command
+            string appidPath = Path.Combine(Environment.CurrentDirectory, "steam_appid.txt");
+            if (!File.Exists(appidPath))
             {
-                WorkingDirectory = Environment.CurrentDirectory
+                try { File.WriteAllText(appidPath, "1281930"); } catch { }
+            }
+
+            // 2. Capture Original Arguments (skipping the executable path)
+            var args = Environment.GetCommandLineArgs().Skip(1);
+            string argString = string.Join(" ", args.Select(a => $"\"{a}\""));
+
+            Process process = new Process();
+            process.StartInfo = new ProcessStartInfo("dotnet", $"\"tModLoader.patched.dll\" {argString}")
+            {
+                WorkingDirectory = Environment.CurrentDirectory,
+                UseShellExecute = false // Inherit environment variables (critical for Steam Overlay)
             };
+
             process.Start();
             Thread.Sleep(1000);
+
             if (Environment.OSVersion.Platform == PlatformID.MacOSX)
             {
                 MethodInfo quitGame = typeof(Main).GetMethod("QuitGame", BindingFlags.NonPublic | BindingFlags.Instance);
                 if (quitGame != null)
                 {
                     quitGame.Invoke(Main.instance, new object[] { });
-
                 }
                 Environment.Exit(0);
             }
@@ -221,7 +272,7 @@ namespace CorePatcher
 
             ILContext context = new ILContext(method);
             ILCursor cursor = new ILCursor(context);
-            
+
             Instruction target = cursor.Instrs[cursor.Index + 3];
             Instruction target2 = cursor.Instrs[2];
             instructions.Insert(3, Instruction.Create(OpCodes.Brtrue, target));
@@ -236,7 +287,7 @@ namespace CorePatcher
 
             cursor.Emit(OpCodes.Ldsfld, infoMessage);
             cursor.EmitLdstr(BuildMessage());
-            cursor.EmitLdsfld(menuMode); 
+            cursor.EmitLdsfld(menuMode);
             cursor.EmitLdnull();
             cursor.EmitLdstr("");
             cursor.EmitLdnull();
@@ -271,7 +322,7 @@ namespace CorePatcher
 
         private static void DelegateToInject()
         {
-            Interface.infoMessage.Show("This is a test message", Main.menuMode);
+            //Interface.infoMessage.Show("This is a test message", Main.menuMode);
         }
 
         private static void EditStaticFieldString(FieldDefinition definition)
@@ -291,57 +342,5 @@ namespace CorePatcher
                 }
             }
         }
-        /*
-    }
-
-    [PatchType("Terraria.Main")]
-    internal class MainMenuPatch : ModCorePatch
-    {
-        /// <summary>
-        /// Patch the string version at the bottom left of the screen
-        /// Mainly just to be able to tell if the patching was a success
-        /// </summary>
-        /// <param name="type"></param>
-        /// <param name="terraria"></param>
-        private static void ModifyVersionStringDefault(TypeDefinition type, AssemblyDefinition terraria)
-        {
-            MethodDefinition staticConstructor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
-
-
-            if (staticConstructor == null)
-            {
-                staticConstructor = new MethodDefinition(".cctor", Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.Private | Mono.Cecil.MethodAttributes.HideBySig | Mono.Cecil.MethodAttributes.SpecialName | Mono.Cecil.MethodAttributes.RTSpecialName, terraria.MainModule.TypeSystem.Void);
-                type.Methods.Add(staticConstructor);
-            }
-
-
-            EditStaticFieldString(type.Fields.FirstOrDefault(p => p.Name == "versionNumber"), "v1.4.4.9 - Core patcher");
-            EditStaticFieldString(type.Fields.FirstOrDefault(p => p.Name == "versionNumber2"), "v1.4.4.9 - Core patcher");
-        }
-
-        private static void EditStaticFieldString(FieldDefinition definition, string value)
-        {
-            MethodDefinition staticConstructor = definition.DeclaringType.Methods.FirstOrDefault(m => m.Name == ".cctor");
-
-            if (staticConstructor != null)
-            {
-                ILProcessor processor = staticConstructor.Body.GetILProcessor();
-
-                IList<Instruction> instructions = new List<Instruction>();
-                instructions.Add(processor.Create(OpCodes.Ldstr, value));
-                instructions.Add(processor.Create(OpCodes.Stsfld, definition));
-                foreach (Instruction instruction in instructions)
-                {
-                    processor.Body.Instructions.Insert(processor.Body.Instructions.Count - 2, instruction);
-                }
-            }
-        }
-        /*
-        private static void AddDetectionField(TypeDefinition type, AssemblyDefinition terraria)
-        {
-            FieldDefinition definition =
-                new FieldDefinition("CorePatched", FieldAttributes.Public | FieldAttributes.Static, type.Module.TypeSystem.Boolean);
-            type.Fields.Add(definition);
-        }*/
     }
 }

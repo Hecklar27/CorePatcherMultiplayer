@@ -1,3 +1,4 @@
-displayName = Terraria Core Patcher
-author = Dradon
-version = 1.2.1
+displayName = Core Patcher Multiplayer
+author = Hecklar
+version = 0.1
+side = both
