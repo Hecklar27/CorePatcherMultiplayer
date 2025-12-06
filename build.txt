@@ -1,4 +1,4 @@
 displayName = Core Patcher Multiplayer
 author = Hecklar
-version = 0.1
+version = 0.5
 side = both

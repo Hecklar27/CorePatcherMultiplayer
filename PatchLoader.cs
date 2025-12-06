@@ -28,63 +28,59 @@ namespace CorePatcher
         private static readonly List<Action> _prePatchList = new List<Action>();
         private static readonly List<Action> _postPatchList = new List<Action>();
 
-        public static void RegisterPrePatchOperation(Action prePatch)
-        {
-            _prePatchList.Add(prePatch);
-        }
+        public static void RegisterPrePatchOperation(Action prePatch) => _prePatchList.Add(prePatch);
+        public static void RegisterPostPatchOperation(Action postPatch) => _postPatchList.Add(postPatch);
+        public static void AddDeps(AssemblyDefinition asmInfo) => PatchDepsEditing.AddDependency(asmInfo);
+        public void Register(ModCorePatch patch) => _patchList.Add(patch);
 
-        public static void RegisterPostPatchOperation(Action postPatch)
-        {
-            _postPatchList.Add(postPatch);
-        }
-
-        public static void AddDeps(AssemblyDefinition asmInfo)
-        {
-            PatchDepsEditing.AddDependency(asmInfo);
-        }
-
-        public void Register(ModCorePatch patch)
-        {
-            _patchList.Add(patch);
-        }
-
-        internal static void PrePatch()
-        {
-            foreach (var action in _prePatchList)
-            {
-                action();
-            }
-        }
-
-        internal static void PostPatch()
-        {
-            foreach (var action in _postPatchList)
-            {
-                action();
-            }
-        }
+        internal static void PrePatch() { foreach (var action in _prePatchList) action(); }
+        internal static void PostPatch() { foreach (var action in _postPatchList) action(); }
 
         internal static void Apply()
         {
-            // 1. Check if the currently running assembly is already patched
+            Console.WriteLine("[CorePatcher] Checking patch status...");
+
+            // 1. Check for Patch Marker in Memory
             if (DetectPatchedAssembly())
             {
+                Console.WriteLine("[CorePatcher] Status: Already Patched (Marker found).");
                 return;
             }
 
-            string originalPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.dll");
-            string backupPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.vanilla.dll");
-            string patchedPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.dll");
-
-            // 2. Load the current assembly into memory
-            // We read from the current executable on disk
-            using var terrariaAssembly = AssemblyDefinition.ReadAssembly(originalPath, new ReaderParameters(ReadingMode.Immediate)
+            // 2. Check execution environment (breaking the restart loop)
+            if (IsRunningPatchedExe())
             {
-                ReadWrite = true,
-                InMemory = true
-            });
+                Console.WriteLine("[CorePatcher] Status: Running 'patched.dll' but marker missing. Skipping patch to prevent lock crash.");
+                return;
+            }
 
-            // 3. Apply Patches
+            // 3. Check for Host & Play scenario: server subprocess with existing patched file in use
+            string patchedPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.dll");
+            if (IsServerSubprocess(patchedPath))
+            {
+                Console.WriteLine("[CorePatcher] Status: Server subprocess detected (Host & Play). Patched file exists and is in use by client. Skipping patch.");
+                return;
+            }
+
+            Console.WriteLine("[CorePatcher] Status: Unpatched. Starting patch process...");
+
+            string originalPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.dll");
+            string tempPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.temp.dll");
+
+            // 4. Safe Copy (Read from temp to avoid lock)
+            try
+            {
+                File.Copy(originalPath, tempPath, true);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"[CorePatcher] Critical: Failed to create temp file. {e.Message}");
+                return;
+            }
+
+            // 5. Patching
+            using var terrariaAssembly = AssemblyDefinition.ReadAssembly(tempPath, new ReaderParameters(ReadingMode.Immediate) { ReadWrite = false, InMemory = true });
+
             foreach (var modCorePatch in _patchList)
             {
                 var attribute = modCorePatch.GetType().GetCustomAttribute(typeof(PatchType), true);
@@ -95,9 +91,7 @@ namespace CorePatcher
                     foreach (var methodInfo in methods)
                     {
                         var @params = methodInfo.GetParameters();
-                        if (@params.Length == 2 &&
-                            @params[0].ParameterType == typeof(TypeDefinition) &&
-                            @params[1].ParameterType == typeof(AssemblyDefinition))
+                        if (@params.Length == 2 && @params[0].ParameterType == typeof(TypeDefinition))
                         {
                             methodInfo.Invoke(modCorePatch, new object[] {
                                 terrariaAssembly.MainModule.Types.First(p => p.FullName == typeName),
@@ -108,231 +102,216 @@ namespace CorePatcher
                 }
             }
 
-            // THE SWAP (Fixes Host & Play)
+            // 6. Save (With Lock Protection)
+            bool saveSuccess = false;
             try
             {
-                if (!File.Exists(backupPath))
-                {
-                    if (File.Exists(originalPath))
-                    {
-                        File.Move(originalPath, backupPath); 
-                    }
-                }
-
-                terrariaAssembly.Write(originalPath);
+                terrariaAssembly.Write(patchedPath);
+                saveSuccess = true;
+                Console.WriteLine("[CorePatcher] Patch file written successfully.");
+            }
+            catch (IOException)
+            {
+                Console.WriteLine("[CorePatcher] Warning: 'tModLoader.patched.dll' is in use. We are likely already running it.");
+                // If we are running it, we assume we are patched enough to continue without crashing.
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[CorePatcher] Critical Error swapping files: {ex.Message}");
-                // Fallback: Try to write to .patched.dll if the swap failed
-                try { terrariaAssembly.Write(patchedPath); } catch { }
+                Console.WriteLine($"[CorePatcher] Error writing patch: {ex.Message}");
             }
 
-            CopyRuntimeConfig();
+            // Cleanup
+            if (File.Exists(tempPath)) try { File.Delete(tempPath); } catch { }
 
-            // Create the start script (Optional, but useful for dedicated servers)
-            // We update this to point to the main DLL now.
-            if (ModContent.GetInstance<CorePatcherConfig>().GenerateServerScripts)
+            if (saveSuccess)
             {
-                string batPath = Path.Combine(Environment.CurrentDirectory, "start-patched-server.bat");
-                File.WriteAllText(batPath, "dotnet tModLoader.dll -server %*");
-            }
+                CopyRuntimeConfig();
 
-            Restart();
+                // Only create scripts if configured
+                if (ModContent.GetInstance<CorePatcherConfig>().GenerateServerScripts)
+                    CreateServerScripts();
+
+                Restart();
+            }
         }
 
-        private static void Restart()
+        /// <summary>
+        /// Detects if we're a server subprocess spawned by Host & Play.
+        /// In this scenario:
+        /// - We're running with -server flag (or similar server indicators)
+        /// - The patched file already exists
+        /// - The patched file is locked (in use by the client process)
+        /// </summary>
+        private static bool IsServerSubprocess(string patchedPath)
         {
-            if (!ModContent.GetInstance<CorePatcherConfig>().ReloadUponPatching)
+            try
             {
-                return;
+                // Must be running as server
+                if (!IsServerMode())
+                    return false;
+
+                // Patched file must exist
+                if (!File.Exists(patchedPath))
+                    return false;
+
+                // Check if patched file is locked (client is using it)
+                if (IsFileLocked(patchedPath))
+                {
+                    return true;
+                }
+
+                // Also check if the patched file was recently modified (within last few minutes)
+                // This catches cases where the file might not be locked but was just created
+                var patchedInfo = new FileInfo(patchedPath);
+                var timeSinceModified = DateTime.Now - patchedInfo.LastWriteTime;
+                if (timeSinceModified.TotalMinutes < 5)
+                {
+                    // Recently patched, likely a Host & Play scenario
+                    return true;
+                }
             }
-
-            // Ensure Steam ID exists
-            string appidPath = Path.Combine(Environment.CurrentDirectory, "steam_appid.txt");
-            if (!File.Exists(appidPath)) try { File.WriteAllText(appidPath, "1281930"); } catch { }
-
-            // Capture launch args
-            var args = Environment.GetCommandLineArgs().Skip(1);
-            string argString = string.Join(" ", args.Select(a => $"\"{a}\""));
-
-            // LAUNCH THE MAIN FILE (Now Patched)
-            Process process = new Process();
-            process.StartInfo = new ProcessStartInfo("dotnet", $"\"tModLoader.dll\" {argString}")
+            catch (Exception ex)
             {
-                WorkingDirectory = Environment.CurrentDirectory,
-                UseShellExecute = false
-            };
+                Console.WriteLine($"[CorePatcher] Warning: Error checking server subprocess status: {ex.Message}");
+            }
+            return false;
+        }
 
-            process.Start();
-            Thread.Sleep(1000);
-            Environment.Exit(0);
+        /// <summary>
+        /// Checks if the current process is running in server mode
+        /// </summary>
+        private static bool IsServerMode()
+        {
+            try
+            {
+                // Check command line args for server indicators
+                var args = Environment.GetCommandLineArgs();
+                if (args.Any(a => a.Equals("-server", StringComparison.OrdinalIgnoreCase)))
+                    return true;
+
+                // Check if Main.dedServ is true (dedicated server flag)
+                // This field might not be set yet during early loading, so we check args first
+                try
+                {
+                    if (Main.dedServ)
+                        return true;
+                }
+                catch { }
+
+                // Check for other server-related arguments
+                if (args.Any(a => a.Equals("-host", StringComparison.OrdinalIgnoreCase)))
+                    return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// Checks if a file is currently locked/in use by another process
+        /// </summary>
+        private static bool IsFileLocked(string filePath)
+        {
+            try
+            {
+                // Try to open the file with exclusive access
+                using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    // If we get here, file is not locked
+                    return false;
+                }
+            }
+            catch (IOException)
+            {
+                // File is locked
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Could also indicate the file is in use
+                return true;
+            }
+            catch
+            {
+                // Other errors - assume not locked
+                return false;
+            }
+        }
+
+        private static bool IsRunningPatchedExe()
+        {
+            try
+            {
+                // Check 1: CLI Args
+                var args = Environment.GetCommandLineArgs();
+                if (args.Any(a => a.Contains("-corepatched") || a.Contains("tModLoader.patched")))
+                    return true;
+
+                // Check 2: AppDomain Friendly Name
+                if (AppDomain.CurrentDomain.FriendlyName.Contains("patched"))
+                    return true;
+
+                // Check 3: Process Main Module (Windows specific)
+                var moduleName = Process.GetCurrentProcess().MainModule?.FileName;
+                if (!string.IsNullOrEmpty(moduleName) && moduleName.Contains("patched"))
+                    return true;
+            }
+            catch { }
+            return false;
         }
 
         public static bool DetectPatchedAssembly()
         {
-            FieldInfo CorePatchedFieldInfo =
-                typeof(Main).GetField("CorePatched", BindingFlags.Public | BindingFlags.Static);
-            return CorePatchedFieldInfo != null;
-        }
-
-        private static void DeleteOnceDone(object sender, EventArgs e)
-        {
-            if (DetectPatchedAssembly())
-            {
-                string runtimeConfigPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.runtimeconfig.json");
-                string runtimeConfigDev = Path.Combine(Environment.CurrentDirectory, "tModLoader.runtimeconfig.dev.json");
-                if (File.Exists(runtimeConfigPath))
-                {
-
-                    File.Delete(Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.runtimeconfig.json"));
-                    File.Delete(Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.runtimeconfig.dev.json"));
-                }
-            }
-        }
-
-        private static void CopyRuntimeConfig()
-        {
-            string runtimeConfigPath = Path.Combine(Environment.CurrentDirectory, "tModLoader.runtimeconfig.json");
-            string runtimeConfigDev = Path.Combine(Environment.CurrentDirectory, "tModLoader.runtimeconfig.dev.json");
-            if (File.Exists(runtimeConfigPath))
-            {
-
-                File.Copy(runtimeConfigPath, Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.runtimeconfig.json"), true);
-                File.Copy(runtimeConfigDev, Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.runtimeconfig.dev.json"), true);
-                PatchDepsEditing.PatchTargetRuntime();
-            }
+            return typeof(Main).GetField("CorePatched", BindingFlags.Public | BindingFlags.Static) != null;
         }
 
         private static void CreateServerScripts()
         {
             try
             {
-                string patchedDll = "tModLoader.patched.dll";
-
-                // Windows Batch Script
                 string batPath = Path.Combine(Environment.CurrentDirectory, "start-patched-server.bat");
-                string batContent = $"@echo off\r\n" +
-                                    $"echo Launching CorePatcher Server...\r\n" +
-                                    $"dotnet \"{patchedDll}\" -server %*\r\n" +
-                                    $"pause";
-                File.WriteAllText(batPath, batContent);
+                File.WriteAllText(batPath, "@echo off\r\necho Launching CorePatcher...\r\ndotnet tModLoader.dll -server %*\r\npause");
 
-                // Linux/Mac Shell Script
                 string shPath = Path.Combine(Environment.CurrentDirectory, "start-patched-server.sh");
-                string shContent = $"#!/bin/sh\n" +
-                                   $"echo \"Launching CorePatcher Server...\"\n" +
-                                   $"dotnet \"{patchedDll}\" -server \"$@\"";
-                File.WriteAllText(shPath, shContent);
+                File.WriteAllText(shPath, "#!/bin/sh\n" + "dotnet tModLoader.dll -server \"$@\"");
 
-                // Attempt chmod +x for Mac/Linux
                 if (Environment.OSVersion.Platform == PlatformID.Unix || Environment.OSVersion.Platform == PlatformID.MacOSX)
-                {
                     try { Process.Start("chmod", $"+x \"{shPath}\""); } catch { }
-                }
             }
-            catch (Exception e)
+            catch { }
+        }
+
+        private static void CopyRuntimeConfig()
+        {
+            string config = Path.Combine(Environment.CurrentDirectory, "tModLoader.runtimeconfig.json");
+            if (File.Exists(config))
             {
-                Console.WriteLine($"[CorePatcher] Failed to create server scripts: {e.Message}");
+                File.Copy(config, Path.Combine(Environment.CurrentDirectory, "tModLoader.patched.runtimeconfig.json"), true);
+                PatchDepsEditing.PatchTargetRuntime();
             }
         }
 
-        [PatchType("Terraria.ModLoader.UI.Interface")]
-        internal class InterfacePatch : ModCorePatch
+        private static void Restart()
         {
-            private static void ModifyModLoaderMenus(TypeDefinition type, AssemblyDefinition terraria)
+            if (!ModContent.GetInstance<CorePatcherConfig>().ReloadUponPatching) return;
+
+            Console.WriteLine("[CorePatcher] Restarting into patched version...");
+
+            // Ensure Steam ID
+            string appid = Path.Combine(Environment.CurrentDirectory, "steam_appid.txt");
+            if (!File.Exists(appid)) try { File.WriteAllText(appid, "1281930"); } catch { }
+
+            // Pass -corepatched flag to guarantee detection next time
+            var args = Environment.GetCommandLineArgs().Skip(1);
+            string argString = string.Join(" ", args.Select(a => $"\"{a}\"")) + " -corepatched";
+
+            Process.Start(new ProcessStartInfo("dotnet", $"\"tModLoader.patched.dll\" {argString}")
             {
-                FieldDefinition definition =
-                new FieldDefinition("CorePatched", FieldAttributes.Public | FieldAttributes.Static, type.Module.TypeSystem.Boolean);
-                var main = terraria.MainModule.Types.First(i => i.FullName == "Terraria.Main").Fields;
-                main.Add(definition);
-                EditStaticFieldString(definition);
+                WorkingDirectory = Environment.CurrentDirectory,
+                UseShellExecute = false
+            });
 
-                if (!ModContent.GetInstance<CorePatcherConfig>().DevMode) return;
-
-                FieldReference infoMessage = terraria.MainModule.Types.First(i => i.FullName == "Terraria.ModLoader.UI.Interface").Fields.First(i => i.Name == "infoMessage");
-                FieldReference menuMode = terraria.MainModule.Types.First(i => i.FullName == "Terraria.Main").Fields.First(i => i.Name == "menuMode");
-
-                FieldReference corePatcher = terraria.MainModule.Types.First(i => i.FullName == "Terraria.Main").Fields.FirstOrDefault(i => i.Name == "CorePatched");
-
-                MethodReference show = terraria.MainModule.Types.First(i => i.FullName == "Terraria.ModLoader.UI.UIInfoMessage").Methods.First(i => i.Name == "Show");
-
-                var method = type.Methods.First(i => i.Name == "ModLoaderMenus");
-
-                var instructions = method.Body.GetILProcessor().Body.Instructions;
-
-                ILContext context = new ILContext(method);
-                ILCursor cursor = new ILCursor(context);
-
-                Instruction target = cursor.Instrs[cursor.Index + 3];
-                Instruction target2 = cursor.Instrs[2];
-                instructions.Insert(3, Instruction.Create(OpCodes.Brtrue, target));
-                instructions.Insert(3, Instruction.Create(OpCodes.Ldsfld, corePatcher));
-
-                Instruction instruction = Instruction.Create(OpCodes.Br, (Instruction)target2.Operand);
-
-                cursor.Index += 5;
-
-                cursor.EmitLdcI4(1);
-                cursor.EmitStsfld(corePatcher);
-
-                cursor.Emit(OpCodes.Ldsfld, infoMessage);
-                cursor.EmitLdstr(BuildMessage());
-                cursor.EmitLdsfld(menuMode);
-                cursor.EmitLdnull();
-                cursor.EmitLdstr("");
-                cursor.EmitLdnull();
-                cursor.EmitLdnull();
-                cursor.EmitCallvirt(show);
-
-                instructions.Insert(cursor.Index, instruction);
-            }
-
-            private static string BuildMessage()
-            {
-                StringBuilder builder = new StringBuilder();
-                builder.AppendLine("Welcome to tModLoader - Core patcher dev mode!");
-                builder.AppendLine("If you see this, this mean you have the dev mode option enabled in the config for Core patcher.");
-                builder.AppendLine("Here are a couple tips to help you in your journey through core modding!");
-                builder.AppendLine();
-                builder.AppendLine("=== View your patches ===");
-                builder.AppendLine("1. Open ILSpy, DNSpy or your favorite program to view C# assembly IL/Code");
-                builder.AppendLine("2. Go in your tML installation folder");
-                builder.AppendLine("3. Drag and drop the tModLoader.patched.dll into ILSpy");
-                builder.AppendLine("4. Go to the method/class where you have done your patches.");
-                builder.AppendLine();
-                builder.AppendLine("=== Debugging your mod with tModLoader - core patcher (Require VS) ===");
-                builder.AppendLine("0. Stay on this screen");
-                builder.AppendLine("1. In VS with your mod project opened go in the Debugging tabs and click on \"Attach to process\" (or press CTRL+ALT+P)");
-                builder.AppendLine("2. In the process list, find a dotnet.exe process with tmodloader as the title.");
-                builder.AppendLine("3. Click on attach and it's done!");
-                builder.AppendLine();
-                builder.AppendLine("Thanks for using core patcher!");
-                return builder.ToString();
-            }
-
-            private static void DelegateToInject()
-            {
-                //Interface.infoMessage.Show("This is a test message", Main.menuMode);
-            }
-
-            private static void EditStaticFieldString(FieldDefinition definition)
-            {
-                MethodDefinition staticConstructor = definition.DeclaringType.Methods.FirstOrDefault(m => m.Name == ".cctor");
-
-                if (staticConstructor != null)
-                {
-                    ILProcessor processor = staticConstructor.Body.GetILProcessor();
-
-                    IList<Instruction> instructions = new List<Instruction>();
-                    instructions.Add(processor.Create(OpCodes.Ldc_I4, 0));
-                    instructions.Add(processor.Create(OpCodes.Stsfld, definition));
-                    foreach (Instruction instruction in instructions)
-                    {
-                        processor.Body.Instructions.Insert(processor.Body.Instructions.Count - 2, instruction);
-                    }
-                }
-            }
+            Thread.Sleep(1000);
+            Environment.Exit(0);
         }
     }
 }
